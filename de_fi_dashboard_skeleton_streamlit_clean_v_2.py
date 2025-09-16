@@ -1,7 +1,6 @@
-# app.py — DeFi Multi‑Wallet Monitor (STRICT per‑wallet + USD recompute)
-# Streamlit dashboard to monitor supply / borrow / collateral for one or more wallets
+# app.py — DeFi Multi‑Wallet Monitor (FINAL, strict per‑wallet)
+# Streamlit dashboard to monitor supply / borrow / collateral for a single or multiple wallets
 # Morpho Blue (strict per-user via filtered list query), Zapper (optional), Pendle (stub)
-# PLUS: robust unit handling + optional USD recompute from token prices (DefiLlama)
 # -----------------------------------------------------------------------------
 # Quick start:
 #   pip install streamlit requests pandas python-dateutil python-dotenv
@@ -17,7 +16,6 @@ from typing import Dict, List, Any, Optional
 import requests
 import pandas as pd
 from dateutil import tz
-from decimal import Decimal, InvalidOperation, getcontext
 import streamlit as st
 
 # Optional dotenv support
@@ -40,10 +38,6 @@ ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY") or (st.secrets["ZAPPER_API_KEY"] if
 
 CHAIN_OPTIONS = [1, 8453, 42161]  # Ethereum, Base, Arbitrum
 HTTP_HEADERS = {"Content-Type": "application/json", "User-Agent": "DeFiWalletMonitor/1.0"}
-
-# Decimal math setup
-getcontext().prec = 50
-CHAIN_SLUG = {1: "ethereum", 8453: "base", 42161: "arbitrum"}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -92,9 +86,8 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
           market {{
             uniqueKey
             whitelisted
-            chainId
-            loanAsset {{ symbol address decimals }}
-            collateralAsset {{ symbol address decimals }}
+            loanAsset {{ symbol decimals }}
+            collateralAsset {{ symbol decimals }}
           }}
           user {{ address }}
           state {{
@@ -185,7 +178,7 @@ def pendle_user_positions_stub(address: str) -> List[Dict[str, Any]]:
 # UI
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="DeFi Multi‑Wallet Monitor", layout="wide")
-st.title("🧭 DeFi Multi‑Wallet Monitor — STRICT per‑wallet + USD fix")
+st.title("🧭 DeFi Multi‑Wallet Monitor — FINAL strict per‑wallet")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -195,7 +188,6 @@ with st.sidebar:
 
     use_morpho = st.checkbox("Fetch Morpho positions", value=True)
     morpho_chain_sel = st.multiselect("Morpho chains", options=CHAIN_OPTIONS, default=[1])
-    recompute_usd = st.checkbox("Recompute USD from token prices (DefiLlama)", value=True)
 
     use_zapper = st.checkbox("Fetch tx & gas via Zapper (API key)", value=bool(ZAPPER_API_KEY))
     tx_chain_sel = st.multiselect("Chains for txs", options=CHAIN_OPTIONS, default=[1, 42161])
@@ -226,124 +218,51 @@ for addr in wallets:
     if use_morpho:
         with tabs[0]:
             morpho_rows: List[Dict[str, Any]] = []
-            total_supply_usd = Decimal(0)
-            total_borrow_usd = Decimal(0)
-            total_collateral_usd = Decimal(0)
+            total_supply_usd = 0.0
+            total_borrow_usd = 0.0
+            total_collateral_usd = 0.0
             debug_msgs: List[str] = []
 
             include_untrusted = st.toggle("Show non‑whitelisted markets (risk of bad pricing)", value=False)
 
             try:
                 items = morpho_user_positions(addr, morpho_chain_sel)
-
-                # Build price query set if recompute_usd
-                price_keys = set()
-                if recompute_usd:
-                    for it in items:
-                        m = it.get("market") or {}
-                        chain_id = m.get("chainId")
-                        for side in ("loanAsset", "collateralAsset"):
-                            a = (m.get(side) or {})
-                            addr_tok = (a.get("address") or "").lower()
-                            if chain_id in CHAIN_SLUG and addr_tok:
-                                price_keys.add(f"{CHAIN_SLUG[chain_id]}:{addr_tok}")
-                prices = {}
-                if recompute_usd and price_keys:
-                    try:
-                        url = "https://coins.llama.fi/prices/current/" + ",".join(sorted(price_keys))
-                        resp = requests.get(url, timeout=15)
-                        prices = (resp.json() or {}).get("coins", {})
-                    except Exception as e:
-                        debug_msgs.append(f"Price fetch failed: {e}")
-                        prices = {}
-
-                def _to_dec(x) -> Decimal:
-                    try:
-                        if x is None:
-                            return Decimal(0)
-                        if isinstance(x, (int, float)):
-                            return Decimal(str(x))
-                        return Decimal(str(x))
-                    except (InvalidOperation, ValueError):
-                        return Decimal(0)
-
-                def _norm_token_amount(raw: Decimal, decimals: int) -> Decimal:
-                    # If looks like raw base units (>> 10**decimals), scale down
-                    threshold = Decimal(10) ** (decimals + 2)
-                    if raw > threshold:
-                        return raw / (Decimal(10) ** decimals)
-                    return raw
-
-                def _price_usd(chain_id: int, token_addr: str) -> Optional[Decimal]:
-                    if not recompute_usd:
-                        return None
-                    if chain_id not in CHAIN_SLUG or not token_addr:
-                        return None
-                    key = f"{CHAIN_SLUG[chain_id]}:{token_addr.lower()}"
-                    p = (prices.get(key) or {}).get("price")
-                    try:
-                        return Decimal(str(p)) if p is not None else None
-                    except Exception:
-                        return None
-
                 for it in items:
                     m = it.get("market") or {}
                     stt = it.get("state") or {}
+                    mk = m.get("uniqueKey")
+
                     if not include_untrusted and m.get("whitelisted") is False:
                         continue
 
-                    chain_id = m.get("chainId")
-                    loan = (m.get("loanAsset") or {})
-                    coll = (m.get("collateralAsset") or {})
+                    # User-level amounts (NOT pool totals)
+                    s_usd = float(stt.get("supplyAssetsUsd") or 0)
+                    b_usd = float(stt.get("borrowAssetsUsd") or 0)
+                    c_usd = float(stt.get("collateralUsd") or 0)
+                    s = float(stt.get("supplyAssets") or 0)
+                    b = float(stt.get("borrowAssets") or 0)
+                    c = float(stt.get("collateral") or 0)
 
-                    mk = m.get("uniqueKey")
-                    loan_dec = int(loan.get("decimals") or 18)
-                    coll_dec = int(coll.get("decimals") or 18)
-                    loan_addr = (loan.get("address") or "").lower()
-                    coll_addr = (coll.get("address") or "").lower()
-
-                    # Raw numbers as Decimal
-                    s_raw = _to_dec(stt.get("supplyAssets"))
-                    b_raw = _to_dec(stt.get("borrowAssets"))
-                    c_raw = _to_dec(stt.get("collateral"))
-
-                    # Normalize token units if needed (divide by 10**decimals if clearly base units)
-                    s = _norm_token_amount(s_raw, loan_dec)
-                    b = _norm_token_amount(b_raw, loan_dec)
-                    c = _norm_token_amount(c_raw, coll_dec)
-
-                    # USD: either recompute via price, or trust API with sanity cap
-                    if recompute_usd:
-                        p_loan = _price_usd(chain_id, loan_addr) or Decimal(0)
-                        p_coll = _price_usd(chain_id, coll_addr) or Decimal(0)
-                        s_usd = s * p_loan
-                        b_usd = b * p_loan
-                        c_usd = c * p_coll
-                    else:
-                        s_usd = _to_dec(stt.get("supplyAssetsUsd"))
-                        b_usd = _to_dec(stt.get("borrowAssetsUsd"))
-                        c_usd = _to_dec(stt.get("collateralUsd"))
-
-                    # sanity clamp to drop aberrant oracle values
-                    if max(s_usd, b_usd, c_usd) > Decimal(1e11):
+                    # Sanity clamp to drop aberrant oracle values
+                    if max(s_usd, b_usd, c_usd) > 1e11:
                         debug_msgs.append(
                             f"Skipped {mk} due to abnormal USD value: borrowUsd={b_usd}, supplyUsd={s_usd}, collateralUsd={c_usd}")
                         continue
 
                     row = {
                         "marketKey": mk,
-                        "loan": loan.get("symbol"),
-                        "collateralAsset": coll.get("symbol"),
-                        "supplyAssets": float(s),
-                        "supplyUsd": float(s_usd),
-                        "borrowAssets": float(b),
-                        "borrowUsd": float(b_usd),
-                        "collateralAmt": float(c),
-                        "collateralUsd": float(c_usd),
+                        "loan": (m.get("loanAsset") or {}).get("symbol"),
+                        "collateralAsset": (m.get("collateralAsset") or {}).get("symbol"),
+                        "supplyAssets": s,
+                        "supplyUsd": s_usd,
+                        "borrowAssets": b,
+                        "borrowUsd": b_usd,
+                        "collateralAmt": c,
+                        "collateralUsd": c_usd,
                     }
-                    total_supply_usd += s_usd
-                    total_borrow_usd += b_usd
-                    total_collateral_usd += c_usd
+                    total_supply_usd += row["supplyUsd"]
+                    total_borrow_usd += row["borrowUsd"]
+                    total_collateral_usd += row["collateralUsd"]
                     morpho_rows.append(row)
             except RuntimeError as e:
                 st.info(f"Morpho: {e}")
@@ -367,7 +286,7 @@ for addr in wallets:
                     with st.expander("Debug log (Morpho)"):
                         for m in debug_msgs:
                             st.code(m)
-                        st.caption("USD recompute uses DefiLlama prices when enabled; token amounts normalized by decimals when needed.")
+                        st.caption("Source: marketPositions(where: { userAddress_in: [<addr>], chainId_in: [<chains>] }) — per‑wallet state only.")
 
             with right:
                 st.metric("Supply USD", f"{total_supply_usd:,.2f}")
@@ -439,4 +358,4 @@ for addr in wallets:
 
     st.divider()
 
-st.caption("This build shows ONLY per-wallet positions (no pool totals) and fixes units via decimals/DefiLlama pricing.")
+st.caption("This build shows ONLY per-wallet positions (no pool totals). Add Net APY, alerts, and Pendle API next.")
