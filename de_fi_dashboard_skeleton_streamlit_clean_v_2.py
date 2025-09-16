@@ -273,13 +273,43 @@ for addr in wallets:
             with left:
                 if morpho_rows:
                     df = pd.DataFrame(morpho_rows)
-                    cols = [
-                        "marketKey", "loan", "collateralAsset",
-                        "supplyAssets", "supplyUsd", "borrowAssets", "borrowUsd",
-                        "collateralAmt", "collateralUsd",
-                    ]
-                    df = df[[c for c in cols if c in df.columns]]
-                    st.dataframe(df, use_container_width=True)
+                    # Toggle pour n'afficher que les emprunts actifs
+                    only_borrow = st.toggle("Afficher uniquement les emprunts actifs (borrow > 0)", value=True, key=f"boronly_{addr}")
+
+                    # Convention demandée: Supply = Collateral (mapping d'affichage)
+                    df["supplyAssets"] = df.get("collateralAmt", 0)
+                    df["supplyUsd"] = df.get("collateralUsd", 0)
+
+                    if only_borrow:
+                        df_show = df[df["borrowUsd"].fillna(0) > 0].copy()
+                        # LTV = borrowUsd / supplyUsd (= collateralUsd)
+                        def _ltv(row):
+                            try:
+                                su = float(row.get("supplyUsd") or 0)
+                                bu = float(row.get("borrowUsd") or 0)
+                                return (bu / su) if su > 0 else None
+                            except Exception:
+                                return None
+                        df_show["ltv"] = df_show.apply(_ltv, axis=1)
+                        show_cols = [
+                            "marketKey","loan","collateralAsset",
+                            "borrowAssets","borrowUsd","supplyAssets","supplyUsd","ltv","whitelisted"
+                        ]
+                    else:
+                        df_show = df.copy()
+                        show_cols = [
+                            "marketKey","loan","collateralAsset",
+                            "borrowAssets","borrowUsd","supplyAssets","supplyUsd","whitelisted"
+                        ]
+                    df_show = df_show[[c for c in show_cols if c in df_show.columns]]
+                    st.dataframe(df_show, use_container_width=True)
+                else:
+                    st.info("No Morpho positions detected for this wallet (or all filtered).")
+                if debug_msgs:
+                    with st.expander("Debug log (Morpho)"):
+                        for m in debug_msgs:
+                            st.code(m)
+                        st.caption("Convention d'affichage: Supply = Collateral. Source Morpho: marketPositions → state{...} par wallet.")
                 else:
                     st.info("No Morpho positions detected for this wallet (or all filtered).")
                 if debug_msgs:
@@ -289,10 +319,11 @@ for addr in wallets:
                         st.caption("Source: marketPositions(where: { userAddress_in: [<addr>], chainId_in: [<chains>] }) — per‑wallet state only.")
 
             with right:
-                st.metric("Supply USD", f"{total_supply_usd:,.2f}")
+                # Ici, on applique la convention demandée: Supply = Collateral
+                st.metric("Supply USD (collateral)", f"{total_collateral_usd:,.2f}")
                 st.metric("Borrow USD", f"{total_borrow_usd:,.2f}")
                 st.metric("Collateral USD", f"{total_collateral_usd:,.2f}")
-                st.metric("Net (Supply−Borrow)", f"{(total_supply_usd - total_borrow_usd):,.2f}")
+                st.metric("Net (Collateral−Borrow)", f"{(total_collateral_usd - total_borrow_usd):,.2f}")
 
     # Transactions + gas (Zapper)
     tx_tab_index = 1 if use_morpho else 0
