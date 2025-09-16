@@ -30,10 +30,12 @@ import requests
 import pandas as pd
 from dateutil import tz
 import streamlit as st
-from dotenv import load_dotenv
-
-# load .env if present
-load_dotenv()
+# Optional dotenv support (no hard dependency)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
