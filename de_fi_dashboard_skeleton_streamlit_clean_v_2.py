@@ -1,5 +1,5 @@
-# app.py — DeFi Multi‑Wallet Monitor (REBUILT, strict per‑wallet)
-# Streamlit dashboard to monitor yield/borrow/collateral across multiple wallets
+# app.py — DeFi Multi‑Wallet Monitor (FINAL, strict per‑wallet)
+# Streamlit dashboard to monitor supply / borrow / collateral for a single or multiple wallets
 # Morpho Blue (strict per-user via filtered list query), Zapper (optional), Pendle (stub)
 # -----------------------------------------------------------------------------
 # Quick start:
@@ -32,7 +32,7 @@ DEFAULT_WALLETS = [
     "0xCCeE77e74C4466DF0dA0ec85F2D3505956fD6Fa7",
 ]
 TIMEZONE = "Europe/Paris"
-MORPHO_GRAPHQL = "https://blue-api.morpho.org/graphql"   # Morpho Blue API
+MORPHO_GRAPHQL = "https://api.morpho.org/graphql"   # Official Morpho GraphQL endpoint
 ZAPPER_GQL = "https://public.zapper.xyz/graphql"
 ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY") or (st.secrets["ZAPPER_API_KEY"] if "ZAPPER_API_KEY" in st.secrets else None)
 
@@ -63,11 +63,11 @@ def _run_graphql(url: str, query: str, variables: Optional[Dict[str, Any]] = Non
     return data
 
 # -----------------------------------------------------------------------------
-# Morpho — strict per-user positions via filtered list query
+# Morpho — STRICT per-user positions via filtered list query (no pool totals)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
-def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -> Dict[str, Any]:
-    """Return ONLY positions for the given wallet, with user-level amounts in state{...}.
+def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """Return ONLY the positions for the given wallet, with user-level amounts in state{...}.
     Uses marketPositions(where: { userAddress_in: [...], chainId_in: [...] }).
     """
     chains_clause = ""
@@ -75,6 +75,7 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
         uniq = ",".join(str(int(c)) for c in sorted(set(chain_ids)))
         chains_clause = f", chainId_in: [{uniq}]"
 
+    # Use .format with doubled braces to avoid f-string conflicts with GraphQL braces
     query_tpl = """
     query {{
       marketPositions(
@@ -101,7 +102,6 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
       }}
     }}
     """
-    # Use .format with doubled braces preserved in the template
     q = query_tpl.format(address=address, chains_clause=chains_clause)
 
     payload = _run_graphql(MORPHO_GRAPHQL, q)
@@ -109,14 +109,23 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
     if "errors" in payload:
         msgs = ", ".join([e.get("message", "") for e in payload.get("errors", [])])
         if "NOT_FOUND" in msgs or "No results matching" in msgs:
-            return {"address": address, "marketPositions": []}
+            return []
         raise RuntimeError(f"Morpho API error: {payload['errors']}")
 
     items = (((payload or {}).get("data") or {}).get("marketPositions") or {}).get("items", [])
-    # Paranoia: hard-filter by wallet address in case API ignores 'where'
+    # Paranoïa : re-filtre par user au cas où l’API ignorerait 'where'
     items = [it for it in items if (it.get("user") or {}).get("address", "").lower() == address.lower()]
 
-    return {"address": address, "marketPositions": items}
+    # Dé-dup par marketKey (rare, mais ça évite un double comptage visuel)
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for it in items:
+        mk = ((it.get("market") or {}).get("uniqueKey"))
+        if mk and mk in seen:
+            continue
+        seen.add(mk)
+        deduped.append(it)
+    return deduped
 
 # -----------------------------------------------------------------------------
 # Zapper (optional)
@@ -169,7 +178,7 @@ def pendle_user_positions_stub(address: str) -> List[Dict[str, Any]]:
 # UI
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="DeFi Multi‑Wallet Monitor", layout="wide")
-st.title("🧭 DeFi Multi‑Wallet Monitor — Strict per‑wallet build")
+st.title("🧭 DeFi Multi‑Wallet Monitor — FINAL strict per‑wallet")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -217,26 +226,24 @@ for addr in wallets:
             include_untrusted = st.toggle("Show non‑whitelisted markets (risk of bad pricing)", value=False)
 
             try:
-                data = morpho_user_positions(addr, morpho_chain_sel)
-                seen_keys = set()
-                for it in data.get("marketPositions", []):
+                items = morpho_user_positions(addr, morpho_chain_sel)
+                for it in items:
                     m = it.get("market") or {}
                     stt = it.get("state") or {}
                     mk = m.get("uniqueKey")
 
-                    if mk in seen_keys:
-                        # de-dup in case API returns duplicates
-                        continue
-                    seen_keys.add(mk)
-
                     if not include_untrusted and m.get("whitelisted") is False:
                         continue
 
+                    # User-level amounts (NOT pool totals)
                     s_usd = float(stt.get("supplyAssetsUsd") or 0)
                     b_usd = float(stt.get("borrowAssetsUsd") or 0)
                     c_usd = float(stt.get("collateralUsd") or 0)
+                    s = float(stt.get("supplyAssets") or 0)
+                    b = float(stt.get("borrowAssets") or 0)
+                    c = float(stt.get("collateral") or 0)
 
-                    # sanity clamp to drop aberrant oracle values
+                    # Sanity clamp to drop aberrant oracle values
                     if max(s_usd, b_usd, c_usd) > 1e11:
                         debug_msgs.append(
                             f"Skipped {mk} due to abnormal USD value: borrowUsd={b_usd}, supplyUsd={s_usd}, collateralUsd={c_usd}")
@@ -246,11 +253,11 @@ for addr in wallets:
                         "marketKey": mk,
                         "loan": (m.get("loanAsset") or {}).get("symbol"),
                         "collateralAsset": (m.get("collateralAsset") or {}).get("symbol"),
-                        "supplyAssets": float(stt.get("supplyAssets") or 0),
+                        "supplyAssets": s,
                         "supplyUsd": s_usd,
-                        "borrowAssets": float(stt.get("borrowAssets") or 0),
+                        "borrowAssets": b,
                         "borrowUsd": b_usd,
-                        "collateralAmt": float(stt.get("collateral") or 0),
+                        "collateralAmt": c,
                         "collateralUsd": c_usd,
                     }
                     total_supply_usd += row["supplyUsd"]
@@ -279,7 +286,7 @@ for addr in wallets:
                     with st.expander("Debug log (Morpho)"):
                         for m in debug_msgs:
                             st.code(m)
-                        st.caption("Source: marketPositions(where: { userAddress_in: [<addr>], chainId_in: [<chains>] }) — hard‑filtered & deduped by marketKey.")
+                        st.caption("Source: marketPositions(where: { userAddress_in: [<addr>], chainId_in: [<chains>] }) — per‑wallet state only.")
 
             with right:
                 st.metric("Supply USD", f"{total_supply_usd:,.2f}")
@@ -351,4 +358,4 @@ for addr in wallets:
 
     st.divider()
 
-st.caption("This build shows ONLY per-wallet positions (no pool totals). To extend: add Net APY, alerts, and Pendle API.")
+st.caption("This build shows ONLY per-wallet positions (no pool totals). Add Net APY, alerts, and Pendle API next.")
