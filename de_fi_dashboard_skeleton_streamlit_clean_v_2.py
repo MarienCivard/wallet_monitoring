@@ -1,30 +1,35 @@
-# streamlit_app.py — CLEAN v2
+# streamlit_app.py
 # Minimal, testable skeleton to monitor yield/borrow/costs across multiple wallets
-# Demo defaults to the sample address provided by the user: 0xCCeE77e74C4466DF0dA0ec85F2D3505956fD6Fa7
-# -----------------------------------------------------------------------------
-# What works out-of-the-box:
-# - Multi-wallet input (regex-based parsing, robust to line breaks)
-# - Morpho Blue positions (GraphQL Blue API, no API key): supply/borrow/collateral by market (token + USD)
-# - Zapper (optional API key): recent signer transactions + gas cost (native); graceful error messages
-# - Clean error handling & no-crash warnings
-# - Pendle panel present as a stub (wire the REST endpoint later)
+# Demo defaults to the sample address you provided: 0xCCeE77e74C4466DF0dA0ec85F2D3505956fD6Fa7
+# ────────────────────────────────────────────────────────────────────────────────
+# Features in this skeleton
+# - Multi‑wallet input (one per line)
+# - Morpho Blue positions (GraphQL, no API key required): supply/borrow USD by market
+# - Zapper (optional, API key): human‑readable txs + per‑tx gas cost
+# - Net overview per wallet: supply USD, borrow USD, net exposure, recent gas costs
+# - Basic alerts placeholders (HF / PT maturity hooks ready)
 #
-# Run locally:
-#   1) pip install streamlit requests pandas python-dateutil python-dotenv
-#   2) export ZAPPER_API_KEY=your_key   (optional)
+# To run locally:
+#   1) pip install streamlit requests pandas python-dotenv python-dateutil
+#   2) Optionally export ZAPPER_API_KEY=your_key  (for transactions & gas)
 #   3) streamlit run streamlit_app.py
-# -----------------------------------------------------------------------------
+#
+# Notes:
+# - Morpho endpoint: https://api.morpho.org/graphql
+# - Pendle user positions are stubbed here; wire them via the Pendle REST API
+#   (Portfolio Positions endpoint) when ready.
+# - This file is intentionally small and easy to extend.
 
 import os
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
 import requests
 import pandas as pd
 from dateutil import tz
 import streamlit as st
-
 # Optional dotenv support (no hard dependency)
 try:
     from dotenv import load_dotenv
@@ -32,23 +37,22 @@ try:
 except Exception:
     pass
 
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 # Config
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 DEFAULT_WALLETS = [
     "0xCCeE77e74C4466DF0dA0ec85F2D3505956fD6Fa7",
 ]
 TIMEZONE = "Europe/Paris"
-MORPHO_GRAPHQL = "https://blue-api.morpho.org/graphql"  # Blue API endpoint
+MORPHO_GRAPHQL = "https://blue-api.morpho.org/graphql"
 ZAPPER_GQL = "https://public.zapper.xyz/graphql"
-ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY") or (st.secrets["ZAPPER_API_KEY"] if "ZAPPER_API_KEY" in st.secrets else None)
+ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY") or (st.secrets["ZAPPER_API_KEY"] if "ZAPPER_API_KEY" in st.secrets else None)  # optional
 
-# We check these chains for Morpho Blue support (you can extend)
-CHAIN_IDS = [1, 8453, 42161]  # Ethereum, Base, Arbitrum
+CHAIN_IDS = [1, 8453, 42161]  # Ethereum, Base, Arbitrum (extend as needed)
 
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 # Helpers
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 
 def to_local(ts_ms: int, tzname: str = TIMEZONE) -> str:
     dt = datetime.utcfromtimestamp(ts_ms / 1000)
@@ -56,10 +60,9 @@ def to_local(ts_ms: int, tzname: str = TIMEZONE) -> str:
 
 @st.cache_data(ttl=300)
 def morpho_user_overview(address: str, chain_id: int = 1) -> Dict[str, Any]:
-    """Query Morpho Blue user data on a given chain.
-    - Uses Blue API endpoint
-    - `state{}` returns user-level amounts (supply/borrow/collateral) per market
-    - Treats NOT_FOUND gracefully as empty
+    """Query Morpho Blue user data on a given chain (per-user amounts).
+    Uses documented fields directly under `marketPositions` to avoid mixing with market totals.
+    Docs show: borrowAssets, borrowAssetsUsd, supplyAssets, supplyAssetsUsd. (Collateral requires a separate query.)
     """
     q = f"""
     query {{
@@ -67,26 +70,20 @@ def morpho_user_overview(address: str, chain_id: int = 1) -> Dict[str, Any]:
         address
         marketPositions {{
           market {{ uniqueKey loanAsset {{ symbol }} collateralAsset {{ symbol }} }}
-          state {{
-            supplyAssets
-            supplyAssetsUsd
-            borrowAssets
-            borrowAssetsUsd
-            collateral
-            collateralUsd
-          }}
+          borrowAssets
+          borrowAssetsUsd
+          supplyAssets
+          supplyAssetsUsd
         }}
         transactions {{ hash timestamp type }}
       }}
     }}
     """
     r = requests.post(MORPHO_GRAPHQL, json={"query": q}, timeout=30)
-    # Parse
     try:
         payload = r.json()
     except Exception:
         raise RuntimeError(f"Morpho API error [{r.status_code}]: {r.text[:200]}")
-    # Errors (e.g., NOT_FOUND)
     if "errors" in payload:
         msgs = ", ".join([e.get("message", "") for e in payload["errors"]])
         if "NOT_FOUND" in msgs or "No results matching" in msgs:
@@ -96,6 +93,7 @@ def morpho_user_overview(address: str, chain_id: int = 1) -> Dict[str, Any]:
     return data or {"address": address, "marketPositions": [], "transactions": []}
 
 @st.cache_data(ttl=300)
+
 def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     if not ZAPPER_API_KEY:
         return {}
@@ -121,7 +119,7 @@ def zapper_tx_details(tx_hash: str, chain_id: int) -> Dict[str, Any]:
     query = """
     query TransactionDetailsV2($hash: String!, $chainId: Int!) {
       transactionDetailsV2(hash: $hash, chainId: $chainId) {
-        transaction { hash gasPrice gas gasUsed blockNumber timestamp }
+        transaction { hash gasPrice gas blockNumber timestamp }
       }
     }
     """
@@ -132,21 +130,64 @@ def zapper_tx_details(tx_hash: str, chain_id: int) -> Dict[str, Any]:
     items = data.get("transactionDetailsV2", [])
     return items[0] if items else {}
 
+# Placeholder for Pendle (wire later with the REST endpoint "Portfolio Positions")
+# return structure: list of dicts with {chainId, marketAddress, ptAddress, notionalUsd, impliedApy, maturityTs}
 @st.cache_data(ttl=300)
 def pendle_user_positions_stub(address: str) -> List[Dict[str, Any]]:
-    # Placeholder; wire to Pendle REST "Portfolio Positions" when ready
     return []
 
-# -----------------------------------------------------------------------------
+@st.cache_data(ttl=300)
+def _morpho_collateral_map(address: str, chain_id: int = 1) -> Dict[str, Dict[str, float]]:
+    """Fetch per-market collateral for a given user via marketPositions list query.
+    Returns { uniqueKey: { collateral, collateralUsd } }.
+    If the filter on chainId/userAddress isn't supported, we fallback to no chain filter.
+    """
+    where_filters = f"where: {{ userAddress_in: [\"{address}\"], chainId_in: [{chain_id}] }}"
+    q = f"""
+    query {{
+      marketPositions(first: 200, {where_filters}) {{
+        items {{ market {{ uniqueKey }} state {{ collateral collateralUsd }} }}
+      }}
+    }}
+    """
+    try:
+        r = requests.post(MORPHO_GRAPHQL, json={"query": q}, timeout=30)
+        payload = r.json()
+    except Exception:
+        return {}
+    if "errors" in payload:
+        q2 = f"""
+        query {{
+          marketPositions(first: 200, where: {{ userAddress_in: [\"{address}\"] }}) {{
+            items {{ market {{ uniqueKey }} state {{ collateral collateralUsd }} }}
+          }}
+        }}
+        """
+        try:
+            r2 = requests.post(MORPHO_GRAPHQL, json={"query": q2}, timeout=30)
+            payload = r2.json()
+        except Exception:
+            return {}
+    items = (((payload or {}).get("data") or {}).get("marketPositions") or {}).get("items", [])
+    out: Dict[str, Dict[str, float]] = {}
+    for it in items:
+        mk = (it.get("market") or {}).get("uniqueKey")
+        stt = it.get("state") or {}
+        if mk:
+            out[mk] = {"collateral": float(stt.get("collateral") or 0), "collateralUsd": float(stt.get("collateralUsd") or 0)}
+    return out  # start empty; keep the table rendering intact
+
+# ────────────────────────────────────────────────────────────────────────────────
 # UI
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="DeFi Multi‑Wallet Monitor (Skeleton)", layout="wide")
-st.title("🧭 DeFi Multi‑Wallet Monitor — Skeleton (CLEAN v2)")
+st.title("🧭 DeFi Multi‑Wallet Monitor — Skeleton")
 st.caption("Demo ready. Add your API keys later to unlock more panels.")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    wallets_text = st.text_area("Wallets (one per line)", value="\n".join(DEFAULT_WALLETS), height=120)
+    wallets_text = st.text_area("Wallets (one per line)", value="
+".join(DEFAULT_WALLETS), height=120)
     # Robust parsing: extract 0x-prefixed 40-hex addresses anywhere in the text
     import re
     wallets = re.findall(r"0x[a-fA-F0-9]{40}", wallets_text)
@@ -170,7 +211,7 @@ st.divider()
 for addr in wallets:
     st.subheader(f"👛 {addr}")
 
-    # Tabs
+    # Morpho block
     if use_morpho:
         tabs = st.tabs(["Morpho", "Transactions", "Pendle (stub)"])
     else:
@@ -186,41 +227,42 @@ for addr in wallets:
             for chain in CHAIN_IDS:
                 try:
                     data = morpho_user_overview(addr, chain)
+                    coll_map = _morpho_collateral_map(addr, chain)
                     for p in data.get("marketPositions", []):
-                        stt = p.get("state", {}) or {}
+                        mk = (p.get("market") or {}).get("uniqueKey")
+                        coll = coll_map.get(mk, {}) if mk else {}
                         row = {
                             "chainId": chain,
-                            "marketKey": (p.get("market") or {}).get("uniqueKey"),
-                            "loan": (p.get("market") or {}).get("loanAsset", {}).get("symbol"),
-                            "collateral": (p.get("market") or {}).get("collateralAsset", {}).get("symbol"),
-                            "supplyAssets": float(stt.get("supplyAssets") or 0),
-                            "supplyUsd": float(stt.get("supplyAssetsUsd") or 0),
-                            "borrowAssets": float(stt.get("borrowAssets") or 0),
-                            "borrowUsd": float(stt.get("borrowAssetsUsd") or 0),
-                            "collateralAmt": float(stt.get("collateral") or 0),
-                            "collateralUsd": float(stt.get("collateralUsd") or 0),
+                            "marketKey": mk,
+                            "loan": p.get("market", {}).get("loanAsset", {}).get("symbol"),
+                            "collateral": p.get("market", {}).get("collateralAsset", {}).get("symbol"),
+                            "supplyAssets": float(p.get("supplyAssets") or 0),
+                            "supplyUsd": float(p.get("supplyAssetsUsd") or 0),
+                            "borrowAssets": float(p.get("borrowAssets") or 0),
+                            "borrowUsd": float(p.get("borrowAssetsUsd") or 0),
+                            "collateralAmt": float(coll.get("collateral") or 0),
+                            "collateralUsd": float(coll.get("collateralUsd") or 0),
                         }
                         total_supply_usd += row["supplyUsd"]
                         total_borrow_usd += row["borrowUsd"]
-                        total_collateral_usd += row["collateralUsd"]
+                        total_collateral_usd += row.get("collateralUsd", 0)
                         morpho_rows.append(row)
-                except RuntimeError as e:
-                    st.info(f"Morpho: {e}")
                 except Exception as e:
                     st.warning(f"Morpho query failed on chain {chain}: {e}")
             left, right = st.columns([2,1])
             with left:
                 if morpho_rows:
                     df = pd.DataFrame(morpho_rows)
+                    # Reorder / rename for readability
                     cols = [
                         "chainId", "marketKey", "loan", "collateral",
                         "supplyAssets", "supplyUsd", "borrowAssets", "borrowUsd",
-                        "collateralAmt", "collateralUsd",
+                        "collateralAmt", "collateralUsd"
                     ]
                     df = df[[c for c in cols if c in df.columns]]
                     st.dataframe(df, use_container_width=True)
                 else:
-                    st.info("No Morpho positions detected (or address inactive on selected chains).")
+                    st.info("No Morpho positions detected (or address inactive).")
             with right:
                 st.metric("Supply USD", f"{total_supply_usd:,.2f}")
                 st.metric("Borrow USD", f"{total_borrow_usd:,.2f}")
@@ -234,43 +276,45 @@ for addr in wallets:
             st.info("Provide ZAPPER_API_KEY to enable tx & gas computations.")
         else:
             try:
-                data = zapper_tx_history([addr], first=20, chain_ids=chains_sel)
-                edges = (data.get("transactionHistoryV2", {}) or {}).get("edges", [])
-            except requests.HTTPError as he:
-                st.warning(f"Zapper API HTTP error: {he}")
-                edges = []
-            except Exception as e:
-                st.warning(f"Zapper API error: {e}")
-                edges = []
+            data = zapper_tx_history([addr], first=20, chain_ids=chains_sel)
+            edges = (data.get("transactionHistoryV2", {}) or {}).get("edges", [])
+        except requests.HTTPError as he:
+            st.warning(f"Zapper API HTTP error: {he}")
+            edges = []
+        except Exception as e:
+            st.warning(f"Zapper API error: {e}")
+            edges = []
             if not edges:
-                st.info("No recent signer transactions found (or no access on selected chains).")
+                st.info("No recent signer transactions found.")
             else:
                 rows = []
-                total_gas_native = 0.0
-                network_to_chain = {
-                    "ETHEREUM_MAINNET": 1,
-                    "ARBITRUM_MAINNET": 42161,
-                    "BASE_MAINNET": 8453,
-                    "POLYGON_POS": 137,
-                }
+                total_gas_native = 0
                 for e in edges:
                     node = e.get("node", {})
                     tx = node.get("transaction", {})
                     tx_hash = tx.get("hash")
                     network = tx.get("network")
                     ts = tx.get("timestamp")
+                    # Zapper uses network names; map to chain id for details
+                    network_to_chain = {
+                        "ETHEREUM_MAINNET": 1,
+                        "ARBITRUM_MAINNET": 42161,
+                        "BASE_MAINNET": 8453,
+                        "POLYGON_POS": 137,
+                    }
                     chain_id = network_to_chain.get(network, 1)
                     details = zapper_tx_details(tx_hash, chain_id)
                     t = details.get("transaction", {})
                     gas_price_wei = int(t.get("gasPrice") or 0)
                     gas_used = int(t.get("gasUsed") or t.get("gas") or 0)
                     gas_cost_wei = gas_price_wei * gas_used
+                    # Show as ETH/chain native; USD conversion intentionally omitted in skeleton
                     gas_cost_native = gas_cost_wei / 1e18
                     total_gas_native += gas_cost_native
                     rows.append({
                         "hash": tx_hash,
                         "network": network,
-                        "time": to_local(ts) if isinstance(ts, (int, float)) else str(ts),
+                        "time": to_local(ts),
                         "gas_used": gas_used,
                         "gas_price_wei": gas_price_wei,
                         "gas_cost_native": gas_cost_native,
@@ -290,13 +334,16 @@ for addr in wallets:
 
     st.divider()
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Extension notes (readme)
+# ────────────────────────────────────────────────────────────────────────────────
 st.markdown(
     """
     ### Next steps
-    1. **Pendle**: Replace the stub with a call to the *User Analytics → Portfolio Positions* endpoint to fetch PT/YT/LP balances + implied APY, then compute **remaining fixed yield** until maturity.
-    2. **Net APY**: Accrue **borrow interest** (Morpho) and net it against **Pendle PT yield**; display a **net APY** KPI.
+    1. **Pendle**: Replace the stub with a call to the *User Analytics → Portfolio Positions* endpoint from the Pendle REST API to fetch PT/YT/LP balances and implied APY, then compute **remaining fixed yield** until maturity.
+    2. **Net APY**: Add a job that accrues **borrow interest** (Morpho) and net it against **Pendle PT yield**; display a **net APY** KPI.
     3. **Alerts**: Add HF < 1.30 and **PT maturity < N days** alerts (Slack/Telegram webhooks).
-    4. **Prices**: Convert gas/native to USD via a pricing API and add PnL.
-    5. **Persistence**: Push snapshots into Postgres (`wallets`, `positions`, `cashflows`, `pnl_daily`) for history charts.
+    4. **Prices**: Convert gas/native to USD via a pricing API (e.g., DeFiLlama) and add PnL.
+    5. **Persistence**: Push snapshots into Postgres (wallets, positions, cashflows, pnl_daily) for history charts.
     """
 )
