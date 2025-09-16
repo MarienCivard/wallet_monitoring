@@ -7,6 +7,13 @@
 #  • Optional USD recompute via DefiLlama prices with decimals normalization
 # -----------------------------------------------------------------------------
 
+# app_multi.py — DeFi Multi-Wallet Monitor (Consolidated + Per-wallet)
+# - Strict per-wallet Morpho positions (no pool totals)
+# - Supply = Collateral (display convention)
+# - Borrow-only toggle
+# - Borrow Rate (APY) per market (robuste, avec fallback)
+# - Optional USD recompute via DefiLlama + decimals normalization
+
 import os
 import re
 from datetime import datetime
@@ -18,7 +25,7 @@ from dateutil import tz
 import streamlit as st
 from decimal import Decimal, InvalidOperation, getcontext
 
-# Optional dotenv support
+# Optional dotenv
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -33,18 +40,17 @@ DEFAULT_WALLETS = [
 ]
 TIMEZONE = "Europe/Paris"
 MORPHO_GRAPHQL = "https://api.morpho.org/graphql"
-HTTP_HEADERS = {"Content-Type": "application/json", "User-Agent": "DeFiWalletMonitor/2.0"}
+HTTP_HEADERS = {"Content-Type": "application/json", "User-Agent": "DeFiWalletMonitor/2.1"}
 
 CHAIN_OPTIONS = [1, 8453, 42161]  # Ethereum, Base, Arbitrum
 CHAIN_SLUG = {1: "ethereum", 8453: "base", 42161: "arbitrum"}
 
-# High precision for money math
+# Haute précision pour les montants
 getcontext().prec = 50
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-
 def to_local(ts_ms: int, tzname: str = TIMEZONE) -> str:
     try:
         dt = datetime.utcfromtimestamp(ts_ms / 1000)
@@ -65,7 +71,7 @@ def _run_graphql(url: str, query: str, variables: Optional[Dict[str, Any]] = Non
     return data
 
 def parse_chain_from_market_key(mk: str) -> Optional[int]:
-    # Many Morpho uniqueKeys start with the chain id followed by '-' (or ':')
+    # La plupart des uniqueKey commencent par le chainId suivi de '-' ou ':'
     try:
         m = re.match(r"^(\d+)[-:]", mk or "")
         return int(m.group(1)) if m else None
@@ -83,7 +89,7 @@ def _to_dec(x) -> Decimal:
         return Decimal(0)
 
 def _norm(raw: Decimal, decimals: int) -> Decimal:
-    # If clearly base units (much larger than 10**decimals), scale down
+    # Si l'ordre de grandeur indique des base units, on / 10**decimals
     threshold = Decimal(10) ** (decimals + 2)
     if raw > threshold:
         return raw / (Decimal(10) ** decimals)
@@ -110,11 +116,11 @@ def _price_from_llama(prices: Dict[str, Any], chain_id: Optional[int], token_add
         return None
 
 # -----------------------------------------------------------------------------
-# Morpho — STRICT per-user positions via filtered list query (no pool totals)
+# Morpho — per-wallet positions (strict)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
-    # Return ONLY the positions for the given wallet; user-level amounts in state{...}.
+    # Retourne UNIQUEMENT les positions du wallet; montants par user dans state{...}
     chains_clause = ""
     if chain_ids:
         uniq = ",".join(str(int(c)) for c in sorted(set(chain_ids)))
@@ -156,8 +162,10 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
         raise RuntimeError(f"Morpho API error: {payload['errors']}")
 
     items = (((payload or {}).get("data") or {}).get("marketPositions") or {}).get("items", [])
+    # Double filtre côté client par sécurité
     items = [it for it in items if (it.get("user") or {}).get("address", "").lower() == address.lower()]
 
+    # Dé-dup (rare)
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for it in items:
@@ -168,7 +176,9 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
         deduped.append(it)
     return deduped
 
-# Borrow APY per market
+# -----------------------------------------------------------------------------
+# Borrow APY par marché (robuste: markets → fallback marketByUniqueKey en batch)
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def morpho_market_borrow_apys(unique_keys: List[str]) -> Dict[str, float]:
     keys = [k for k in dict.fromkeys(unique_keys) if k]
@@ -179,48 +189,117 @@ def morpho_market_borrow_apys(unique_keys: List[str]) -> Dict[str, float]:
         """
         query($keys:[String!]) {
           markets(first:300, where:{ uniqueKey_in: $keys }) {
-            items { uniqueKey rates { borrowApy } }
+            items {
+              uniqueKey
+              rates { borrowApy borrowApr }
+              apy   { borrowApy borrowApr }
+            }
           }
         }
         """,
         """
         query($keys:[String!]) {
           markets(first:300, where:{ uniqueKey_in: $keys }) {
-            items { uniqueKey apy { borrowApy } }
+            items {
+              uniqueKey
+              rates { borrowApy borrowApr }
+            }
           }
         }
         """,
         """
         query($keys:[String!]) {
           markets(first:300, where:{ uniqueKey_in: $keys }) {
-            items { uniqueKey state { borrowRate } }
+            items {
+              uniqueKey
+              apy { borrowApy borrowApr }
+            }
           }
         }
         """,
     ]
 
+    def _extract_apys_from_items(items) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for it in items or []:
+            uk = it.get("uniqueKey")
+            rates = it.get("rates") or {}
+            apy = it.get("apy") or {}
+            val = (
+                rates.get("borrowApy")
+                or apy.get("borrowApy")
+                or rates.get("borrowApr")
+                or apy.get("borrowApr")
+            )
+            if val is not None:
+                try:
+                    out[uk] = float(val)
+                except Exception:
+                    pass
+        return out
+
+    # 1) Essai via markets(...)
     for gql in variants:
         try:
             data = _run_graphql(MORPHO_GRAPHQL, gql, {"keys": keys})
             if "errors" in data:
                 continue
             items = (((data.get("data") or {}).get("markets") or {}).get("items") or [])
-            apys: Dict[str, float] = {}
-            for it in items:
-                uk = it.get("uniqueKey")
-                rates = it.get("rates") or it.get("apy")
-                if isinstance(rates, dict) and ("borrowApy" in rates):
-                    apys[uk] = float(rates.get("borrowApy") or 0.0)
-                else:
-                    stt = it.get("state") or {}
-                    br = stt.get("borrowRate")
-                    if br is not None:
-                        apys[uk] = float(br)
+            apys = _extract_apys_from_items(items)
             if apys:
                 return apys
         except Exception:
             pass
-    return {}
+
+    # 2) Fallback solide: batch de marketByUniqueKey via alias GraphQL
+    def _fetch_batch(batch_keys: List[str]) -> Dict[str, float]:
+        alias_blocks = []
+        for i, k in enumerate(batch_keys):
+            alias_blocks.append(f"""
+              k{i}: marketByUniqueKey(uniqueKey: "{k}") {{
+                uniqueKey
+                rates {{ borrowApy borrowApr }}
+                apy   {{ borrowApy borrowApr }}
+                state {{ borrowRate borrowApr borrowApy }}
+              }}
+            """)
+        q = "query {\n" + "\n".join(alias_blocks) + "\n}"
+        try:
+            data = _run_graphql(MORPHO_GRAPHQL, q)
+            if "errors" in data:
+                return {}
+            d = (data.get("data") or {})
+            out: Dict[str, float] = {}
+            for v in d.values():
+                if not isinstance(v, dict):
+                    continue
+                uk = v.get("uniqueKey")
+                rates = v.get("rates") or {}
+                apy = v.get("apy") or {}
+                state = v.get("state") or {}
+                val = (
+                    rates.get("borrowApy")
+                    or apy.get("borrowApy")
+                    or rates.get("borrowApr")
+                    or apy.get("borrowApr")
+                    or state.get("borrowRate")
+                )
+                if (uk is not None) and (val is not None):
+                    try:
+                        out[uk] = float(val)
+                    except Exception:
+                        pass
+            return out
+        except Exception:
+            return {}
+
+    apys_total: Dict[str, float] = {}
+    CHUNK = 25
+    for i in range(0, len(keys), CHUNK):
+        chunk = keys[i:i+CHUNK]
+        apys_total.update(_fetch_batch(chunk))
+
+    return apys_total
 
 # -----------------------------------------------------------------------------
 # UI
@@ -250,11 +329,9 @@ col3.metric("Chains", ", ".join(map(str, morpho_chain_sel)) if morpho_chain_sel 
 
 st.divider()
 
-# Fetch positions for all wallets
+# Récupération positions (tous wallets) + clés prix si recompute
 all_rows: List[Dict[str, Any]] = []
 debug_msgs: List[str] = []
-
-# Pre-collect price keys if recompute_usd
 price_keys: List[str] = []
 wallet_items_map: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -281,7 +358,7 @@ for addr in wallets:
 
 prices = _fetch_prices(price_keys) if recompute_usd else {}
 
-# Build unified per-wallet rows (with Supply = Collateral convention)
+# Construction des lignes unifiées (Supply = Collateral)
 for addr in wallets:
     items = wallet_items_map.get(addr, [])
     for it in items:
@@ -306,7 +383,7 @@ for addr in wallets:
         b = _norm(b_raw, loan_dec)
         c = _norm(c_raw, coll_dec)
 
-        # USD numbers: recompute if price found; otherwise fallback to API
+        # USD (recompute si possible, sinon API)
         if recompute_usd:
             p_loan = _price_from_llama(prices, cid, loan_addr) or Decimal(0)
             p_coll = _price_from_llama(prices, cid, coll_addr) or Decimal(0)
@@ -327,7 +404,7 @@ for addr in wallets:
             debug_msgs.append(f"{addr} / {mk}: abnormal USD → skipped")
             continue
 
-        # Supply = Collateral (display convention)
+        # Supply = Collateral (affichage)
         supply_amt = c
         supply_usd = c_usd
 
@@ -344,19 +421,18 @@ for addr in wallets:
         }
         all_rows.append(row)
 
-# Borrow APY per market
+# Borrow APY par marché
 try:
     mk_list = [r.get("marketKey") for r in all_rows if r.get("marketKey")]
     apy_map = morpho_market_borrow_apys(mk_list) if mk_list else {}
 except Exception:
     apy_map = {}
 
-# ---------------- Consolidated tab ----------------
+# ---------------- Vue consolidée ----------------
 tab_cons, tab_per = st.tabs(["📊 Consolidated", "🧩 Per-wallet detail"])
 
 with tab_cons:
     st.subheader("Consolidated view (all selected wallets)")
-
     if not all_rows:
         st.info("No Morpho positions detected for selected wallets (or filtered out).")
     else:
@@ -370,26 +446,18 @@ with tab_cons:
 
         df_all["borrowRate"] = df_all["borrowRateRaw"].apply(_fmt_rate)
 
-        # Borrow-only toggle (consolidated)
         only_borrow_cons = st.toggle("Borrow-only (consolidated)", value=True, key="boronly_cons")
-
         df_show = df_all.copy()
         if only_borrow_cons:
             df_show = df_show[df_show["borrowUsd"].fillna(0) > 0]
 
-        # Aggregate by market (sum across wallets)
-        agg_cols = {
-            "borrowAssets": "sum",
-            "borrowUsd": "sum",
-            "supplyAssets": "sum",
-            "supplyUsd": "sum",
-        }
+        # Agrégat par marché (somme sur tous les wallets)
+        agg_cols = {"borrowAssets": "sum", "borrowUsd": "sum", "supplyAssets": "sum", "supplyUsd": "sum"}
         df_agg = df_show.groupby(["marketKey","loan","collateralAsset","whitelisted","borrowRate"], dropna=False).agg(agg_cols).reset_index()
 
-        # LTV on aggregated rows
+        # LTV agrégée
         df_agg["ltv"] = df_agg.apply(lambda r: (r["borrowUsd"]/r["supplyUsd"]) if r["supplyUsd"]>0 else None, axis=1)
 
-        # Totals
         total_supply_usd = float(df_agg["supplyUsd"].fillna(0).sum())
         total_borrow_usd = float(df_agg["borrowUsd"].fillna(0).sum())
 
@@ -403,14 +471,16 @@ with tab_cons:
             st.metric("Net (Collateral − Borrow)", f"{(total_supply_usd - total_borrow_usd):,.2f}")
 
         with st.expander("Underlying rows (by wallet)"):
-            st.dataframe(df_show[["wallet","marketKey","loan","collateralAsset","borrowUsd","supplyUsd","borrowRate","whitelisted"]], use_container_width=True)
+            st.dataframe(
+                df_show[["wallet","marketKey","loan","collateralAsset","borrowUsd","supplyUsd","borrowRate","whitelisted"]],
+                use_container_width=True
+            )
 
-# ---------------- Per-wallet detail tab ----------------
+# ---------------- Vue par wallet ----------------
 with tab_per:
     if not all_rows:
         st.info("No Morpho positions for the selected wallets.")
     else:
-        # Build per-wallet views
         for addr in wallets:
             st.markdown(f"### 👛 {addr}")
             df_w = pd.DataFrame([r for r in all_rows if r["wallet"] == addr])
@@ -419,6 +489,7 @@ with tab_per:
                 continue
 
             df_w["borrowRateRaw"] = df_w["marketKey"].map(apy_map)
+
             def _fmt_rate(x):
                 if pd.isna(x): return None
                 x = float(x)
@@ -429,10 +500,8 @@ with tab_per:
             only_borrow = st.toggle("Afficher uniquement les emprunts actifs (borrow > 0)", value=True, key=f"boronly_{addr}")
             df_show = df_w[df_w["borrowUsd"].fillna(0) > 0] if only_borrow else df_w.copy()
 
-            # LTV
             df_show["ltv"] = df_show.apply(lambda r: (r["borrowUsd"]/r["supplyUsd"]) if r["supplyUsd"]>0 else None, axis=1)
 
-            # Totaux
             total_supply_usd = float(df_show["supplyUsd"].fillna(0).sum())
             total_borrow_usd = float(df_show["borrowUsd"].fillna(0).sum())
 
@@ -452,4 +521,5 @@ if debug_msgs:
     with st.expander("Debug log"):
         for m in debug_msgs:
             st.code(m)
-        st.caption("Notes: per-wallet positions; Supply=Collateral (display); optional USD recompute via DefiLlama; borrow rate fetched via markets query.")
+        st.caption("Notes: per-wallet positions; Supply=Collateral; USD recompute option; borrow rate via markets/fallback marketByUniqueKey.")
+ fetched via markets query.")
