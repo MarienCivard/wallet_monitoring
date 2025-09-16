@@ -521,5 +521,7 @@ if debug_msgs:
     with st.expander("Debug log"):
         for m in debug_msgs:
             st.code(m)
-        st.caption("Notes: per-wallet positions; Supply=Collateral; USD recompute option; borrow rate via markets/fallback marketByUniqueKey.")
- fetched via markets query.")
+        st.caption(
+            "Notes: per-wallet positions; Supply=Collateral; USD recompute option; "
+            "borrow rate via markets/fallback marketByUniqueKey."
+        )
