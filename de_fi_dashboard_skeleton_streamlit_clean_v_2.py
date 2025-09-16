@@ -133,7 +133,7 @@ def morpho_user_positions(address: str, chain_ids: Optional[List[int]] = None) -
 # Zapper (optional)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
-def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional[List[int]] = None) -> Dict[str, Any]]:
+def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     if not ZAPPER_API_KEY:
         return {}
     query = """
