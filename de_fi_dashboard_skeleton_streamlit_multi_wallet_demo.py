@@ -30,6 +30,10 @@ import requests
 import pandas as pd
 from dateutil import tz
 import streamlit as st
+from dotenv import load_dotenv
+
+# load .env if present
+load_dotenv()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
@@ -38,9 +42,9 @@ DEFAULT_WALLETS = [
     "0xCCeE77e74C4466DF0dA0ec85F2D3505956fD6Fa7",
 ]
 TIMEZONE = "Europe/Paris"
-MORPHO_GRAPHQL = "https://api.morpho.org/graphql"
+MORPHO_GRAPHQL = "https://blue-api.morpho.org/graphql"
 ZAPPER_GQL = "https://public.zapper.xyz/graphql"
-ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY")  # optional
+ZAPPER_API_KEY = os.getenv("ZAPPER_API_KEY") or (st.secrets["ZAPPER_API_KEY"] if "ZAPPER_API_KEY" in st.secrets else None)  # optional
 
 CHAIN_IDS = [1, 8453, 42161]  # Ethereum, Base, Arbitrum (extend as needed)
 
@@ -54,33 +58,35 @@ def to_local(ts_ms: int, tzname: str = TIMEZONE) -> str:
 
 @st.cache_data(ttl=300)
 def morpho_user_overview(address: str, chain_id: int = 1) -> Dict[str, Any]:
-    # Minimal query: overview per user with market positions (USD sums per position)
-    q = {
-        "query": """
-        query UserByAddress($chainId: Int!, $address: Address!) {
-          userByAddress(chainId: $chainId, address: $address) {
-            address
-            marketPositions {
-              market { uniqueKey loanAsset { symbol } collateralAsset { symbol } }
-              borrowAssets
-              borrowAssetsUsd
-              supplyAssets
-              supplyAssetsUsd
-              collateral
-              collateralUsd
-            }
-            transactions(first: 5) {
-              items { hash timestamp type }
-            }
-          }
-        }
-        """,
-        "variables": {"chainId": chain_id, "address": address},
-    }
-    r = requests.post(MORPHO_GRAPHQL, json=q, timeout=30)
-    r.raise_for_status()
-    data = r.json()["data"]["userByAddress"]
-    return data or {"address": address, "marketPositions": [], "transactions": {"items": []}}
+    """
+    Query Morpho Blue for a user's overview on a given chain.
+    We embed variables inline to avoid custom-scalar mismatches.
+    Note: `transactions` is a simple list (no `items`).
+    """
+    q = f"""
+    query {{
+      userByAddress(chainId: {chain_id}, address: \"{address}\") {{
+        address
+        marketPositions {{
+          market {{ uniqueKey loanAsset {{ symbol }} collateralAsset {{ symbol }} }}
+          borrowAssets
+          borrowAssetsUsd
+          supplyAssets
+          supplyAssetsUsd
+        }}
+        transactions {{ hash timestamp type }}
+      }}
+    }}
+    """
+    r = requests.post(MORPHO_GRAPHQL, json={"query": q}, timeout=30)
+    try:
+        payload = r.json()
+    except Exception:
+        raise RuntimeError(f"Morpho API error [{r.status_code}]: {r.text[:300]}")
+    if r.status_code >= 400 or "errors" in payload:
+        raise RuntimeError(f"Morpho API error [{r.status_code}]: {payload.get('errors') or payload}")
+    data = payload.get("data", {}).get("userByAddress")
+    return data or {"address": address, "marketPositions": [], "transactions": []}
 
 @st.cache_data(ttl=300)
 def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional[List[int]] = None) -> Dict[str, Any]:
@@ -96,7 +102,7 @@ def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional
     variables = {"subjects": addresses, "first": first, "filters": {}}
     if chain_ids:
         variables["filters"]["chainIds"] = chain_ids
-    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY}
+    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "x-api-key": ZAPPER_API_KEY, "Authorization": f"Bearer {ZAPPER_API_KEY}"}
     r = requests.post(ZAPPER_GQL, json={"query": query, "variables": variables}, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json().get("data", {})
@@ -112,7 +118,7 @@ def zapper_tx_details(tx_hash: str, chain_id: int) -> Dict[str, Any]:
       }
     }
     """
-    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY}
+    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "x-api-key": ZAPPER_API_KEY, "Authorization": f"Bearer {ZAPPER_API_KEY}"}
     r = requests.post(ZAPPER_GQL, json={"query": query, "variables": {"hash": tx_hash, "chainId": chain_id}}, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json().get("data", {})
@@ -228,7 +234,7 @@ for addr in wallets:
                     details = zapper_tx_details(tx_hash, chain_id)
                     t = details.get("transaction", {})
                     gas_price_wei = int(t.get("gasPrice") or 0)
-                    gas_used = int(t.get("gas") or 0)
+                    gas_used = int(t.get("gasUsed") or t.get("gas") or 0)
                     gas_cost_wei = gas_price_wei * gas_used
                     # Show as ETH/chain native; USD conversion intentionally omitted in skeleton
                     gas_cost_native = gas_cost_wei / 1e18
