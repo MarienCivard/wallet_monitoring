@@ -63,52 +63,57 @@ def _run_morpho_query(query: str) -> Dict[str, Any]:
 
 @st.cache_data(ttl=300)
 def morpho_user_positions(address: str, chain_id: int) -> Dict[str, Any]:
-    """Return user positions by market from Morpho Blue.
-    Tries to fetch user-level supply/borrow (and collateral if available).
-    Falls back gracefully if certain fields are unavailable on the API.
+    """Return user positions by market from Morpho Blue using the *list* query.
+    This avoids mixing in market totals and lets us fetch user state in one place.
+    We also request market.whitelisted to filter out untrusted markets (bad oracle).
     """
-    # Attempt 1: ask for collateral at user level (may not be supported)
-    q1 = f"""
+    q = f"""
     query {{
-      userByAddress(chainId: {chain_id}, address: \"{address}\") {{
-        address
-        marketPositions {{
-          market {{ uniqueKey loanAsset {{ symbol }} collateralAsset {{ symbol }} }}
-          borrowAssets
-          borrowAssetsUsd
-          supplyAssets
-          supplyAssetsUsd
-          collateral
-          collateralUsd
+      marketPositions(
+        first: 300,
+        where: {{ userAddress_in: [\"{address}\"], chainId_in: [{chain_id}] }}
+      ) {{
+        items {{
+          market {{
+            uniqueKey
+            whitelisted
+            loanAsset {{ symbol decimals }}
+            collateralAsset {{ symbol decimals }}
+          }}
+          state {{
+            supplyAssets
+            supplyAssetsUsd
+            borrowAssets
+            borrowAssetsUsd
+            collateral
+            collateralUsd
+          }}
         }}
       }}
     }}
     """
-    payload = _run_morpho_query(q1)
-    # If collateral is not a valid field on this edge, retry without it
-    if "errors" in payload and any("collateral" in (e.get("message", "") + str(e)) for e in payload.get("errors", [])):
+    payload = _run_morpho_query(q)
+    if "errors" in payload:
+        msgs = ", ".join([e.get("message", "") for e in payload.get("errors", [])])
+        if "NOT_FOUND" in msgs or "No results matching" in msgs:
+            return {"address": address, "marketPositions": []}
+        # Fallback without chain filter if needed
         q2 = f"""
         query {{
-          userByAddress(chainId: {chain_id}, address: \"{address}\") {{
-            address
-            marketPositions {{
-              market {{ uniqueKey loanAsset {{ symbol }} collateralAsset {{ symbol }} }}
-              borrowAssets
-              borrowAssetsUsd
-              supplyAssets
-              supplyAssetsUsd
+          marketPositions(
+            first: 300,
+            where: {{ userAddress_in: [\"{address}\"] }}
+          ) {{
+            items {{
+              market {{ uniqueKey whitelisted loanAsset {{ symbol decimals }} collateralAsset {{ symbol decimals }} }}
+              state {{ supplyAssets supplyAssetsUsd borrowAssets borrowAssetsUsd collateral collateralUsd }}
             }}
           }}
         }}
         """
         payload = _run_morpho_query(q2)
-    if "errors" in payload:
-        msgs = ", ".join([e.get("message", "") for e in payload["errors"]])
-        if "NOT_FOUND" in msgs or "No results matching" in msgs:
-            return {"address": address, "marketPositions": []}
-        raise RuntimeError(f"Morpho API error: {payload['errors']}")
-    data = (payload.get("data") or {}).get("userByAddress") or {}
-    return data or {"address": address, "marketPositions": []}
+    items = (((payload or {}).get("data") or {}).get("marketPositions") or {}).get("items", [])
+    return {"address": address, "marketPositions": items}
 
 @st.cache_data(ttl=300)
 def morpho_collateral_map(address: str, chain_id: int) -> Dict[str, Dict[str, float]]:
@@ -239,32 +244,52 @@ for addr in wallets:
             total_borrow_usd = 0.0
             total_collateral_usd = 0.0
             debug_msgs = []
+            for addr in wallets:
+    st.subheader(f"👛 {addr}")
+
+    # Tabs
+    if use_morpho:
+        tabs = st.tabs(["Morpho", "Transactions", "Pendle (stub)"])
+    else:
+        tabs = st.tabs(["Transactions", "Pendle (stub)"])
+
+    # Morpho tab
+    if use_morpho:
+        with tabs[0]:
+            morpho_rows: List[Dict[str, Any]] = []
+            total_supply_usd = 0.0
+            total_borrow_usd = 0.0
+            total_collateral_usd = 0.0
+            debug_msgs = []
+            # Option to include only whitelisted markets
+            include_untrusted = st.toggle("Show non‑whitelisted markets (risk of bad pricing)", value=False)
             for chain in CHAIN_IDS:
                 try:
                     data = morpho_user_positions(addr, chain)
-                    # Attempt collateral map (fills missing user collateral per market)
-                    coll_map: Dict[str, Dict[str, float]] = {}
-                    try:
-                        coll_map = morpho_collateral_map(addr, chain)
-                    except Exception as e:
-                        debug_msgs.append(f"Collateral map failed on chain {chain}: {e}")
-                        coll_map = {}
-                    for p in data.get("marketPositions", []):
-                        mk = (p.get("market") or {}).get("uniqueKey")
-                        coll = coll_map.get(mk, {}) if mk else {}
+                    for it in data.get("marketPositions", []):
+                        m = it.get("market") or {}
+                        stt = it.get("state") or {}
+                        if not include_untrusted and m.get("whitelisted") is False:
+                            # Skip untrusted markets to avoid aberrant USD valuations
+                            continue
+                        # Sanity clamp: drop nonsense USD values (likely bad oracles)
+                        b_usd = float(stt.get("borrowAssetsUsd") or 0)
+                        s_usd = float(stt.get("supplyAssetsUsd") or 0)
+                        c_usd = float(stt.get("collateralUsd") or 0)
+                        if max(b_usd, s_usd, c_usd) > 1e11:
+                            debug_msgs.append(f"Skipped market {m.get('uniqueKey')} on chain {chain} due to abnormal USD value: borrowUsd={b_usd}, supplyUsd={s_usd}, collateralUsd={c_usd}")
+                            continue
                         row = {
                             "chainId": chain,
-                            "marketKey": mk,
-                            "loan": (p.get("market") or {}).get("loanAsset", {}).get("symbol"),
-                            "collateralAsset": (p.get("market") or {}).get("collateralAsset", {}).get("symbol"),
-                            # user-level amounts
-                            "supplyAssets": float(p.get("supplyAssets") or 0),
-                            "supplyUsd": float(p.get("supplyAssetsUsd") or 0),
-                            "borrowAssets": float(p.get("borrowAssets") or 0),
-                            "borrowUsd": float(p.get("borrowAssetsUsd") or 0),
-                            # collateral from secondary query
-                            "collateralAmt": float(coll.get("collateral") or 0),
-                            "collateralUsd": float(coll.get("collateralUsd") or 0),
+                            "marketKey": m.get("uniqueKey"),
+                            "loan": (m.get("loanAsset") or {}).get("symbol"),
+                            "collateralAsset": (m.get("collateralAsset") or {}).get("symbol"),
+                            "supplyAssets": float(stt.get("supplyAssets") or 0),
+                            "supplyUsd": s_usd,
+                            "borrowAssets": float(stt.get("borrowAssets") or 0),
+                            "borrowUsd": b_usd,
+                            "collateralAmt": float(stt.get("collateral") or 0),
+                            "collateralUsd": c_usd,
                         }
                         total_supply_usd += row["supplyUsd"]
                         total_borrow_usd += row["borrowUsd"]
@@ -286,7 +311,7 @@ for addr in wallets:
                     df = df[[c for c in cols if c in df.columns]]
                     st.dataframe(df, use_container_width=True)
                 else:
-                    st.info("No Morpho positions detected (or address inactive on selected chains).")
+                    st.info("No Morpho positions detected (or all filtered as untrusted/aberrant).")
                 if debug_msgs:
                     with st.expander("Debug log (Morpho)"):
                         for m in debug_msgs:
