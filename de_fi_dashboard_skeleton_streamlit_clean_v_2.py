@@ -62,13 +62,15 @@ def _run_morpho_query(query: str) -> Dict[str, Any]:
     return payload
 
 @st.cache_data(ttl=300)
+@st.cache_data(ttl=300)
 def morpho_user_positions(address: str, chain_id: int) -> Dict[str, Any]:
-    """Return user positions by market from Morpho Blue using userByAddress.
-    This guarantees per-user amounts for borrow/supply. Collateral is joined from a separate list query.
     """
-    q = f"""
+    User positions from Morpho Blue (par utilisateur, pas totaux de pool).
+    On interroge userByAddress et on lit directement les champs user-level.
+    """
+    q1 = f"""
     query {{
-      userByAddress(chainId: {chain_id}, address: \"{address}\") {{
+      userByAddress(chainId: {chain_id}, address: "{address}") {{
         address
         marketPositions {{
           market {{
@@ -85,31 +87,19 @@ def morpho_user_positions(address: str, chain_id: int) -> Dict[str, Any]:
       }}
     }}
     """
-    payload = _run_morpho_query(q)
+    payload = _run_morpho_query(q1)
+
+    # Gestion propre des erreurs
     if "errors" in payload:
-        msgs = ", ".join([e.get("message", "") for e in payload.get("errors", [])])
+        msgs = ", ".join(e.get("message", "") for e in payload.get("errors", []))
         if "NOT_FOUND" in msgs or "No results matching" in msgs:
             return {"address": address, "marketPositions": []}
+        # remonte l'erreur lisiblement
         raise RuntimeError(f"Morpho API error: {payload['errors']}")
+
     data = (payload.get("data") or {}).get("userByAddress") or {}
     return data or {"address": address, "marketPositions": []}
-        # Fallback without chain filter if needed
-        q2 = f"""
-        query {{
-          marketPositions(
-            first: 300,
-            where: {{ userAddress_in: [\"{address}\"] }}
-          ) {{
-            items {{
-              market {{ uniqueKey whitelisted loanAsset {{ symbol decimals }} collateralAsset {{ symbol decimals }} }}
-              state {{ supplyAssets supplyAssetsUsd borrowAssets borrowAssetsUsd collateral collateralUsd }}
-            }}
-          }}
-        }}
-        """
-        payload = _run_morpho_query(q2)
-    items = (((payload or {}).get("data") or {}).get("marketPositions") or {}).get("items", [])
-    return {"address": address, "marketPositions": items}
+
 
 @st.cache_data(ttl=300)
 def morpho_collateral_map(address: str, chain_id: int) -> Dict[str, Dict[str, float]]:
