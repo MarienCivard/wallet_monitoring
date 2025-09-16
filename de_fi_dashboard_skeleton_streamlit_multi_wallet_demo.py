@@ -114,7 +114,7 @@ def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional
     variables = {"subjects": addresses, "first": first, "filters": {}}
     if chain_ids:
         variables["filters"]["chainIds"] = chain_ids
-    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "User-Agent": "WalletMonitor/1.0"}"}
+    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "User-Agent": "WalletMonitor/1.0"}
     r = requests.post(ZAPPER_GQL, json={"query": query, "variables": variables}, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json().get("data", {})
@@ -130,7 +130,7 @@ def zapper_tx_details(tx_hash: str, chain_id: int) -> Dict[str, Any]:
       }
     }
     """
-    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "User-Agent": "WalletMonitor/1.0"}"}
+    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "User-Agent": "WalletMonitor/1.0"}
     r = requests.post(ZAPPER_GQL, json={"query": query, "variables": {"hash": tx_hash, "chainId": chain_id}}, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json().get("data", {})
