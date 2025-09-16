@@ -226,7 +226,7 @@ col4.metric("Chains (tx)", ", ".join(map(str, chains_sel)) if chains_sel else "a
 
 st.divider()
 
-# Per‑wallet sections
+# Per-wallet sections
 for addr in wallets:
     st.subheader(f"👛 {addr}")
 
@@ -236,7 +236,7 @@ for addr in wallets:
     else:
         tabs = st.tabs(["Transactions", "Pendle (stub)"])
 
-    # Morpho tab
+    # Morpho
     if use_morpho:
         with tabs[0]:
             morpho_rows: List[Dict[str, Any]] = []
@@ -244,41 +244,29 @@ for addr in wallets:
             total_borrow_usd = 0.0
             total_collateral_usd = 0.0
             debug_msgs = []
-            for addr in wallets:
-    st.subheader(f"👛 {addr}")
 
-    # Tabs
-    if use_morpho:
-        tabs = st.tabs(["Morpho", "Transactions", "Pendle (stub)"])
-    else:
-        tabs = st.tabs(["Transactions", "Pendle (stub)"])
+            include_untrusted = st.toggle("Show non-whitelisted markets (risk of bad pricing)", value=False)
 
-    # Morpho tab
-    if use_morpho:
-        with tabs[0]:
-            morpho_rows: List[Dict[str, Any]] = []
-            total_supply_usd = 0.0
-            total_borrow_usd = 0.0
-            total_collateral_usd = 0.0
-            debug_msgs = []
-            # Option to include only whitelisted markets
-            include_untrusted = st.toggle("Show non‑whitelisted markets (risk of bad pricing)", value=False)
             for chain in CHAIN_IDS:
                 try:
                     data = morpho_user_positions(addr, chain)
                     for it in data.get("marketPositions", []):
                         m = it.get("market") or {}
                         stt = it.get("state") or {}
+
                         if not include_untrusted and m.get("whitelisted") is False:
-                            # Skip untrusted markets to avoid aberrant USD valuations
                             continue
-                        # Sanity clamp: drop nonsense USD values (likely bad oracles)
+
                         b_usd = float(stt.get("borrowAssetsUsd") or 0)
                         s_usd = float(stt.get("supplyAssetsUsd") or 0)
                         c_usd = float(stt.get("collateralUsd") or 0)
                         if max(b_usd, s_usd, c_usd) > 1e11:
-                            debug_msgs.append(f"Skipped market {m.get('uniqueKey')} on chain {chain} due to abnormal USD value: borrowUsd={b_usd}, supplyUsd={s_usd}, collateralUsd={c_usd}")
+                            debug_msgs.append(
+                                f"Skipped market {m.get('uniqueKey')} on chain {chain} "
+                                f"due to abnormal USD value: borrowUsd={b_usd}, supplyUsd={s_usd}, collateralUsd={c_usd}"
+                            )
                             continue
+
                         row = {
                             "chainId": chain,
                             "marketKey": m.get("uniqueKey"),
@@ -299,7 +287,8 @@ for addr in wallets:
                     st.info(f"Morpho: {e}")
                 except Exception as e:
                     st.warning(f"Morpho query failed on chain {chain}: {e}")
-            left, right = st.columns([2,1])
+
+            left, right = st.columns([2, 1])
             with left:
                 if morpho_rows:
                     df = pd.DataFrame(morpho_rows)
@@ -312,10 +301,12 @@ for addr in wallets:
                     st.dataframe(df, use_container_width=True)
                 else:
                     st.info("No Morpho positions detected (or all filtered as untrusted/aberrant).")
+
                 if debug_msgs:
                     with st.expander("Debug log (Morpho)"):
                         for m in debug_msgs:
                             st.code(m)
+
             with right:
                 st.metric("Supply USD", f"{total_supply_usd:,.2f}")
                 st.metric("Borrow USD", f"{total_borrow_usd:,.2f}")
@@ -337,6 +328,7 @@ for addr in wallets:
             except Exception as e:
                 st.warning(f"Zapper API error: {e}")
                 edges = []
+
             if not edges:
                 st.info("No recent signer transactions found (or no access on selected chains).")
             else:
@@ -384,6 +376,7 @@ for addr in wallets:
             st.info("No Pendle data (stub). Add the API call to fetch PT/YT/LP holdings & implied APY.")
 
     st.divider()
+
 
 st.markdown(
     """
