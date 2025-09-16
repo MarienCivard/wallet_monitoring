@@ -62,8 +62,8 @@ def to_local(ts_ms: int, tzname: str = TIMEZONE) -> str:
 def morpho_user_overview(address: str, chain_id: int = 1) -> Dict[str, Any]:
     """
     Query Morpho Blue for a user's overview on a given chain.
-    We embed variables inline to avoid custom-scalar mismatches.
-    Note: `transactions` is a simple list (no `items`).
+    - Treat NOT_FOUND as empty (no positions on that chain for this user).
+    - Use `state { ... }` to fetch user-level amounts incl. collateral.
     """
     q = f"""
     query {{
@@ -71,26 +71,36 @@ def morpho_user_overview(address: str, chain_id: int = 1) -> Dict[str, Any]:
         address
         marketPositions {{
           market {{ uniqueKey loanAsset {{ symbol }} collateralAsset {{ symbol }} }}
-          borrowAssets
-          borrowAssetsUsd
-          supplyAssets
-          supplyAssetsUsd
+          state {{
+            supplyAssets
+            supplyAssetsUsd
+            borrowAssets
+            borrowAssetsUsd
+            collateral
+            collateralUsd
+          }}
         }}
         transactions {{ hash timestamp type }}
       }}
     }}
     """
     r = requests.post(MORPHO_GRAPHQL, json={"query": q}, timeout=30)
+    # Best-effort JSON parse
     try:
-        payload = r.json()
+      payload = r.json()
     except Exception:
-        raise RuntimeError(f"Morpho API error [{r.status_code}]: {r.text[:300]}")
-    if r.status_code >= 400 or "errors" in payload:
-        raise RuntimeError(f"Morpho API error [{r.status_code}]: {payload.get('errors') or payload}")
+      raise RuntimeError(f"Morpho API error [{r.status_code}]: {r.text[:200]}")
+    # Graceful handling of NOT_FOUND (no data for chain/user)
+    if "errors" in payload:
+      msgs = ", ".join([e.get("message", "") for e in payload["errors"]])
+      if "NOT_FOUND" in msgs or "No results matching" in msgs:
+        return {"address": address, "marketPositions": [], "transactions": []}
+      raise RuntimeError(f"Morpho API error [{r.status_code}]: {payload['errors']}")
     data = payload.get("data", {}).get("userByAddress")
     return data or {"address": address, "marketPositions": [], "transactions": []}
 
 @st.cache_data(ttl=300)
+
 def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     if not ZAPPER_API_KEY:
         return {}
@@ -104,7 +114,7 @@ def zapper_tx_history(addresses: List[str], first: int = 20, chain_ids: Optional
     variables = {"subjects": addresses, "first": first, "filters": {}}
     if chain_ids:
         variables["filters"]["chainIds"] = chain_ids
-    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "x-api-key": ZAPPER_API_KEY, "Authorization": f"Bearer {ZAPPER_API_KEY}"}
+    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "User-Agent": "WalletMonitor/1.0"}"}
     r = requests.post(ZAPPER_GQL, json={"query": query, "variables": variables}, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json().get("data", {})
@@ -120,7 +130,7 @@ def zapper_tx_details(tx_hash: str, chain_id: int) -> Dict[str, Any]:
       }
     }
     """
-    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "x-api-key": ZAPPER_API_KEY, "Authorization": f"Bearer {ZAPPER_API_KEY}"}
+    headers = {"Content-Type": "application/json", "x-zapper-api-key": ZAPPER_API_KEY, "User-Agent": "WalletMonitor/1.0"}"}
     r = requests.post(ZAPPER_GQL, json={"query": query, "variables": {"hash": tx_hash, "chainId": chain_id}}, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json().get("data", {})
@@ -142,8 +152,11 @@ st.caption("Demo ready. Add your API keys later to unlock more panels.")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    wallets_text = st.text_area("Wallets (one per line)", value="\n".join(DEFAULT_WALLETS), height=120)
-    wallets = [w.strip() for w in wallets_text.splitlines() if w.strip()]
+    wallets_text = st.text_area("Wallets (one per line)", value="
+".join(DEFAULT_WALLETS), height=120)
+    # Robust parsing: extract 0x-prefixed 40-hex addresses anywhere in the text
+    import re
+    wallets = re.findall(r"0x[a-fA-F0-9]{40}", wallets_text)
     use_morpho = st.checkbox("Fetch Morpho positions", value=True)
     use_zapper = st.checkbox("Fetch tx & gas via Zapper (API key)", value=bool(ZAPPER_API_KEY))
     chains_sel = st.multiselect("Chains for txs", options=[1, 8453, 42161], default=[1, 42161])
@@ -180,14 +193,19 @@ for addr in wallets:
                 try:
                     data = morpho_user_overview(addr, chain)
                     for p in data.get("marketPositions", []):
+                        stt = p.get("state", {}) or {}
                         row = {
                             "chainId": chain,
                             "marketKey": p.get("market", {}).get("uniqueKey"),
                             "loan": p.get("market", {}).get("loanAsset", {}).get("symbol"),
                             "collateral": p.get("market", {}).get("collateralAsset", {}).get("symbol"),
-                            "supplyUsd": float(p.get("supplyAssetsUsd") or 0),
-                            "borrowUsd": float(p.get("borrowAssetsUsd") or 0),
-                            "collateralUsd": float(p.get("collateralUsd") or 0),
+                            "supplyAssets": float(stt.get("supplyAssets") or 0),
+                            "supplyUsd": float(stt.get("supplyAssetsUsd") or 0),
+                            "borrowAssets": float(stt.get("borrowAssets") or 0),
+                            "borrowUsd": float(stt.get("borrowAssetsUsd") or 0),
+                            "collateral": p.get("market", {}).get("collateralAsset", {}).get("symbol"),
+                            "collateralAmt": float(stt.get("collateral") or 0),
+                            "collateralUsd": float(stt.get("collateralUsd") or 0),
                         }
                         total_supply_usd += row["supplyUsd"]
                         total_borrow_usd += row["borrowUsd"]
@@ -198,6 +216,13 @@ for addr in wallets:
             with left:
                 if morpho_rows:
                     df = pd.DataFrame(morpho_rows)
+                    # Reorder / rename for readability
+                    cols = [
+                        "chainId", "marketKey", "loan", "collateral",
+                        "supplyAssets", "supplyUsd", "borrowAssets", "borrowUsd",
+                        "collateralAmt", "collateralUsd"
+                    ]
+                    df = df[[c for c in cols if c in df.columns]]
                     st.dataframe(df, use_container_width=True)
                 else:
                     st.info("No Morpho positions detected (or address inactive).")
@@ -212,8 +237,15 @@ for addr in wallets:
         if not ZAPPER_API_KEY:
             st.info("Provide ZAPPER_API_KEY to enable tx & gas computations.")
         else:
+            try:
             data = zapper_tx_history([addr], first=20, chain_ids=chains_sel)
             edges = (data.get("transactionHistoryV2", {}) or {}).get("edges", [])
+        except requests.HTTPError as he:
+            st.warning(f"Zapper API HTTP error: {he}")
+            edges = []
+        except Exception as e:
+            st.warning(f"Zapper API error: {e}")
+            edges = []
             if not edges:
                 st.info("No recent signer transactions found.")
             else:
